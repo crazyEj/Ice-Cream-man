@@ -1,4 +1,4 @@
-markdown# Ice Cream Platform
+# Ice Cream Platform
 
 Secure, multi-channel backend architecture for an ice cream business spanning:
 
@@ -7,24 +7,7 @@ Secure, multi-channel backend architecture for an ice cream business spanning:
 - **Corporate Catering** — mobile catering booking & staff scheduling
 - **D2C Subscriptions** — recurring gourmet pint delivery
 
-## Repo Structure
-
-icecream-platform/
-├── architecture/
-│   └── ARCHITECTURE.md        # Three-tier system design, ASCII diagram, channel mapping
-├── database/
-│   └── schema.sql              # PostgreSQL DDL: RBAC, POS, wholesale, catering, subscriptions, audit log
-├── services/
-│   └── auth-service/
-│       ├── auth_service.py     # FastAPI OIDC + MFA (TOTP) + JWT + RBAC boilerplate
-│       ├── requirements.txt
-│       └── .env.example
-├── docs/
-│   └── SECURITY_CHECKLIST.md   # Cloud deployment security checklist (AWS/GCP)
-└── .github/workflows/
-└── ci.yml                  # Lint + dependency audit on push/PR
-
-
+<img width="747" height="462" alt="image" src="https://github.com/user-attachments/assets/da6f87e9-8597-4b64-8cf2-ee29df7d1069" />
 
 
 ## Design Principles
