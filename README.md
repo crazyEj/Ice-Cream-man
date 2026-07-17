@@ -22,7 +22,7 @@ icecream-platform/
 ├── docs/
 │   └── SECURITY_CHECKLIST.md   # Cloud deployment security checklist (AWS/GCP)
 └── .github/workflows/
-└── ci.yml                  # Lint + dependency audit on push/PR
+    └── ci.yml                  # Lint + dependency audit on push/PR
 
 
 ## Design Principles
