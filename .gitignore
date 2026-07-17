@@ -1,0 +1,32 @@
+# --- Secrets — never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Node / Next.js (for future frontend) ---
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# --- Database ---
+*.sqlite3
+pgdata/
+
+# --- OS / Editor ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
