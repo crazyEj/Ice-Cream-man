@@ -1,4 +1,4 @@
-markdown# Ice Cream Platform
+# Ice Cream Platform
 
 Secure, multi-channel backend architecture for an ice cream business spanning:
 
@@ -23,8 +23,6 @@ icecream-platform/
 │   └── SECURITY_CHECKLIST.md   # Cloud deployment security checklist (AWS/GCP)
 └── .github/workflows/
 └── ci.yml                  # Lint + dependency audit on push/PR
-
-
 
 
 ## Design Principles
