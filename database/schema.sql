@@ -37,14 +37,20 @@ CREATE TABLE users (
 );
 
 CREATE TABLE user_roles (
+    user_role_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     role_id     SMALLINT NOT NULL REFERENCES roles(role_id) ON DELETE RESTRICT,
     -- Optional scoping: a wholesale_partner role is scoped to one client account
     scope_type  VARCHAR(30),              -- 'store', 'wholesale_client', 'global', NULL
     scope_id    UUID,                     -- FK-like pointer resolved per scope_type
     granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    granted_by  UUID REFERENCES users(user_id),
-    PRIMARY KEY (user_id, role_id, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'))
+    granted_by  UUID REFERENCES users(user_id)
+);
+
+-- PRIMARY KEY can't contain expressions, so uniqueness (treating NULL scope_id as a
+-- single shared value) is enforced via this index instead of a composite PK.
+CREATE UNIQUE INDEX uq_user_roles_scope ON user_roles (
+    user_id, role_id, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000')
 );
 
 CREATE INDEX idx_user_roles_user ON user_roles(user_id);
