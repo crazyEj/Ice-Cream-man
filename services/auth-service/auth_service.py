@@ -1,24 +1,24 @@
 """
 auth_service.py
 -----------------
-Boilerplate secure authentication endpoint set for the Ice Cream Platform.
+Working authentication service for the Ice Cream Platform (local-dev ready).
 
-Demonstrates:
+Flow:
   - OAuth2 password + MFA (TOTP) second factor
   - Short-lived JWT access tokens + rotating refresh tokens
   - RBAC enforcement via a reusable dependency
-  - Strict Pydantic input validation (the Python analogue of Zod/Joi)
-  - Account lockout after repeated failed attempts (brute-force mitigation)
-  - Audit logging hook on every sensitive action
+  - Strict Pydantic input validation
+  - Account lockout after repeated failed attempts
+  - Audit logging on every sensitive action
 
 Run with: uvicorn auth_service:app --reload
-Requires: fastapi, uvicorn, pydantic, python-jose[cryptography], passlib[argon2], pyotp, asyncpg
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -26,39 +26,43 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr, constr, field_validator
 from jose import jwt, JWTError
 from passlib.context import CryptContext
+from cryptography.fernet import Fernet
 import pyotp
 
+import config
+import db
+
 # ---------------------------------------------------------------------
-# Config (in production: pull from a secrets manager, never hardcode)
+# Config
 # ---------------------------------------------------------------------
 
-JWT_SECRET = "__LOAD_FROM_SECRETS_MANAGER__"          # e.g. AWS Secrets Manager / GCP Secret Manager
-JWT_ALGORITHM = "RS256"                                  # prefer asymmetric signing (RS256) over HS256
-ACCESS_TOKEN_TTL_MINUTES = 15                            # short-lived by design
+ACCESS_TOKEN_TTL_MINUTES = 15
 REFRESH_TOKEN_TTL_DAYS = 7
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")   # argon2id > bcrypt for new systems
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+fernet = Fernet(config.MFA_ENCRYPTION_KEY.encode())
 
-app = FastAPI(title="IceCreamPlatform Auth Service")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.init_pool()
+    yield
+    await db.close_pool()
+
+
+app = FastAPI(title="IceCreamPlatform Auth Service", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------
-# Strict input schemas (equivalent role to Zod/Joi on the Node side)
+# Input schemas
 # ---------------------------------------------------------------------
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: constr(min_length=12, max_length=128)
-
-    @field_validator("password")
-    @classmethod
-    def password_complexity(cls, v: str) -> str:
-        if not any(c.isupper() for c in v) or not any(c.isdigit() for c in v):
-            raise ValueError("Password must contain an uppercase letter and a digit")
-        return v
 
 
 class MfaVerifyRequest(BaseModel):
@@ -73,76 +77,103 @@ class TokenResponse(BaseModel):
     expires_in: int
 
 
+class RegisterRequest(BaseModel):
+    """Local-dev-only helper endpoint to create a test user. In production,
+    user provisioning goes through the OIDC provider, not this endpoint."""
+    email: EmailStr
+    password: constr(min_length=12, max_length=128)
+    full_name: constr(min_length=1, max_length=150)
+    role: constr(min_length=1, max_length=50) = "subscriber"
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        if not any(c.isupper() for c in v) or not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain an uppercase letter and a digit")
+        return v
+
+
+class RegisterResponse(BaseModel):
+    user_id: str
+    email: str
+    totp_secret: str          # shown once so you can add it to an authenticator app
+    totp_provisioning_uri: str
+
+
 # ---------------------------------------------------------------------
-# Simulated data-access layer
-# In production these are parameterized queries via an ORM / query
-# builder (SQLAlchemy, asyncpg with $1 placeholders) — NEVER raw string
-# concatenation, which is how SQL injection happens.
+# Dev-only: create a user with MFA already enabled, so you can exercise
+# the full login flow immediately. Not present in a production deployment.
 # ---------------------------------------------------------------------
 
-async def get_user_by_email(email: str) -> Optional[dict]:
-    """Placeholder — replace with a parameterized query, e.g.:
-    await conn.fetchrow("SELECT * FROM users WHERE email = $1", email)
-    """
-    raise NotImplementedError
+@app.post("/dev/register", response_model=RegisterResponse)
+async def dev_register(payload: RegisterRequest):
+    if config.ENVIRONMENT != "development":
+        raise HTTPException(status_code=404, detail="Not found.")
 
+    existing = await db.get_user_by_email(payload.email)
+    if existing:
+        raise HTTPException(status_code=409, detail="User already exists.")
 
-async def record_audit_event(actor_user_id: Optional[str], action: str,
-                              target_type: str, target_id: Optional[str],
-                              request: Request) -> None:
-    """Fire-and-forget onto a queue (SQS/PubSub) in production so it never
-    blocks the auth path; still guaranteed via DLQ + retry consumer."""
-    _ = {
-        "actor_user_id": actor_user_id,
-        "action": action,
-        "target_entity_type": target_type,
-        "target_entity_id": target_id,
-        "ip_address": request.client.host if request.client else None,
-        "user_agent": request.headers.get("user-agent"),
-        "created_at": dt.datetime.utcnow().isoformat(),
-    }
-    # await audit_queue.publish(_)
+    password_hash = pwd_context.hash(payload.password)
+    totp_secret = pyotp.random_base32()
+    encrypted_secret = fernet.encrypt(totp_secret.encode())
+
+    user = await db.create_user(
+        email=payload.email,
+        password_hash=password_hash,
+        full_name=payload.full_name,
+        mfa_enabled=True,
+        mfa_secret_encrypted=encrypted_secret,
+    )
+    await db.grant_role(user["user_id"], payload.role)
+
+    uri = pyotp.TOTP(totp_secret).provisioning_uri(name=payload.email, issuer_name="IceCreamPlatform")
+
+    return RegisterResponse(
+        user_id=str(user["user_id"]),
+        email=user["email"],
+        totp_secret=totp_secret,
+        totp_provisioning_uri=uri,
+    )
 
 
 # ---------------------------------------------------------------------
 # Step 1: Password login -> issues a short-lived MFA challenge token
-# (NOT a full access token) if credentials are valid.
 # ---------------------------------------------------------------------
 
-@app.post("/auth/login", response_model=dict, status_code=status.HTTP_200_OK)
+@app.post("/auth/login")
 async def login(payload: LoginRequest, request: Request):
-    user = await get_user_by_email(payload.email)
+    user = await db.get_user_by_email(payload.email)
 
-    # Constant-shape response whether the user exists or not, to avoid
-    # user-enumeration via response timing/content differences.
     generic_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid email or password.",
     )
 
     if user is None:
-        pwd_context.dummy_verify()  # burn equivalent CPU time to avoid timing side-channel
+        pwd_context.dummy_verify()
         raise generic_error
 
-    if user.get("locked_until") and user["locked_until"] > dt.datetime.utcnow():
+    if user.get("locked_until") and user["locked_until"] > dt.datetime.now(dt.timezone.utc):
         raise HTTPException(
             status_code=status.HTTP_423_LOCKED,
             detail="Account temporarily locked due to repeated failed attempts.",
         )
 
     if not pwd_context.verify(payload.password, user["password_hash"]):
-        await _register_failed_attempt(user)
+        await db.register_failed_attempt(user["user_id"], MAX_FAILED_ATTEMPTS, LOCKOUT_MINUTES)
         raise generic_error
 
+    await db.reset_failed_attempts(user["user_id"])
+
     if not user.get("mfa_enabled"):
-        # Platform policy: MFA is mandatory for all staff/admin/wholesale roles.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="MFA setup required before login can complete.",
         )
 
-    mfa_challenge_token = _issue_short_lived_challenge(user["user_id"], ttl_seconds=300)
-    await record_audit_event(user["user_id"], "LOGIN_PASSWORD_OK_MFA_PENDING", "users", user["user_id"], request)
+    mfa_challenge_token = _issue_short_lived_challenge(str(user["user_id"]), ttl_seconds=300)
+    await _audit(str(user["user_id"]), "LOGIN_PASSWORD_OK_MFA_PENDING", "users", str(user["user_id"]), request)
 
     return {"mfa_challenge_token": mfa_challenge_token, "mfa_method": "totp"}
 
@@ -156,8 +187,8 @@ async def verify_mfa(payload: MfaVerifyRequest, request: Request):
     try:
         claims = jwt.decode(
             payload.mfa_challenge_token,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
+            config.JWT_SECRET,
+            algorithms=[config.JWT_ALGORITHM],
             options={"require": ["exp", "sub", "purpose"]},
         )
     except JWTError:
@@ -167,19 +198,22 @@ async def verify_mfa(payload: MfaVerifyRequest, request: Request):
         raise HTTPException(status_code=401, detail="Invalid token purpose.")
 
     user_id = claims["sub"]
-    user = await get_user_by_id(user_id)  # implement alongside get_user_by_email
+    user = await db.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail="User no longer exists.")
 
-    totp = pyotp.TOTP(_decrypt_mfa_secret(user["mfa_secret_encrypted"]))
+    totp_secret = fernet.decrypt(bytes(user["mfa_secret_encrypted"])).decode()
+    totp = pyotp.TOTP(totp_secret)
     if not totp.verify(payload.totp_code, valid_window=1):
-        await record_audit_event(user_id, "MFA_VERIFY_FAILED", "users", user_id, request)
+        await _audit(user_id, "MFA_VERIFY_FAILED", "users", user_id, request)
         raise HTTPException(status_code=401, detail="Invalid MFA code.")
 
-    roles = await get_user_roles(user_id)   # [{role_name, scope_type, scope_id}, ...]
+    roles = await db.get_user_roles(user_id)
 
     access_token = _issue_access_token(user_id, roles)
     refresh_token = _issue_refresh_token(user_id)
 
-    await record_audit_event(user_id, "LOGIN_SUCCESS", "users", user_id, request)
+    await _audit(user_id, "LOGIN_SUCCESS", "users", user_id, request)
 
     return TokenResponse(
         access_token=access_token,
@@ -193,7 +227,7 @@ async def verify_mfa(payload: MfaVerifyRequest, request: Request):
 # ---------------------------------------------------------------------
 
 def _issue_short_lived_challenge(user_id: str, ttl_seconds: int) -> str:
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     claims = {
         "sub": user_id,
         "purpose": "mfa_challenge",
@@ -201,62 +235,50 @@ def _issue_short_lived_challenge(user_id: str, ttl_seconds: int) -> str:
         "exp": now + dt.timedelta(seconds=ttl_seconds),
         "jti": str(uuid.uuid4()),
     }
-    return jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(claims, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
 
 
 def _issue_access_token(user_id: str, roles: list[dict]) -> str:
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     claims = {
         "sub": user_id,
         "purpose": "access",
         "roles": [r["role_name"] for r in roles],
-        # scope claims let services enforce row-level isolation (e.g. wholesale_client_id)
-        "scopes": [{"type": r["scope_type"], "id": r["scope_id"]} for r in roles if r["scope_type"]],
+        "scopes": [{"type": r["scope_type"], "id": str(r["scope_id"]) if r["scope_id"] else None}
+                   for r in roles if r["scope_type"]],
         "iat": now,
         "exp": now + dt.timedelta(minutes=ACCESS_TOKEN_TTL_MINUTES),
         "jti": str(uuid.uuid4()),
     }
-    return jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(claims, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
 
 
 def _issue_refresh_token(user_id: str) -> str:
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     claims = {
         "sub": user_id,
         "purpose": "refresh",
         "iat": now,
         "exp": now + dt.timedelta(days=REFRESH_TOKEN_TTL_DAYS),
-        "jti": str(uuid.uuid4()),   # store jti server-side to allow revocation / rotation detection
+        "jti": str(uuid.uuid4()),
     }
-    return jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(claims, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
 
 
-async def _register_failed_attempt(user: dict) -> None:
-    """Increment failed_login_attempts; lock account after threshold.
-    Implement as: UPDATE users SET failed_login_attempts = failed_login_attempts + 1,
-    locked_until = CASE WHEN failed_login_attempts + 1 >= $1 THEN now() + interval '15 minutes' END
-    WHERE user_id = $2
-    """
-    raise NotImplementedError
-
-
-async def get_user_by_id(user_id: str) -> dict:
-    raise NotImplementedError
-
-
-async def get_user_roles(user_id: str) -> list[dict]:
-    raise NotImplementedError
-
-
-def _decrypt_mfa_secret(encrypted_secret: bytes) -> str:
-    """Decrypt using an envelope-encryption pattern: data key wrapped by KMS.
-    Never store or log the plaintext TOTP secret."""
-    raise NotImplementedError
+async def _audit(actor_user_id: Optional[str], action: str, target_type: str,
+                  target_id: Optional[str], request: Request) -> None:
+    await db.write_audit_event(
+        actor_user_id=actor_user_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
 
 
 # ---------------------------------------------------------------------
-# RBAC dependency — reusable across every protected route in every
-# service (POS, Wholesale, Catering, Subscription)
+# RBAC dependency — reusable across every protected route
 # ---------------------------------------------------------------------
 
 class CurrentUser(BaseModel):
@@ -269,8 +291,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
     try:
         claims = jwt.decode(
             token,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
+            config.JWT_SECRET,
+            algorithms=[config.JWT_ALGORITHM],
             options={"require": ["exp", "sub", "purpose"]},
         )
     except JWTError:
@@ -283,8 +305,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
 
 
 def require_roles(*allowed_roles: str):
-    """Usage: @app.get('/wholesale/orders', dependencies=[Depends(require_roles('wholesale_partner','wholesale_ops','global_admin'))])"""
-
     async def checker(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
         if not set(current_user.roles) & set(allowed_roles):
             raise HTTPException(status_code=403, detail="Insufficient permissions for this resource.")
@@ -293,10 +313,13 @@ def require_roles(*allowed_roles: str):
     return checker
 
 
+@app.get("/auth/me", response_model=CurrentUser)
+async def whoami(current_user: CurrentUser = Depends(get_current_user)):
+    return current_user
+
+
 # ---------------------------------------------------------------------
-# Example protected route showing object-level authorization (anti-BOLA)
-# A wholesale_partner may only ever see their OWN client's orders — the
-# scope check happens server-side, never trusting a client-supplied ID alone.
+# Example protected route — object-level authorization (anti-BOLA)
 # ---------------------------------------------------------------------
 
 @app.get("/wholesale/orders/{order_id}")
@@ -305,16 +328,13 @@ async def get_wholesale_order(
     current_user: CurrentUser = Depends(require_roles("wholesale_partner", "wholesale_ops", "global_admin")),
 ):
     if "wholesale_ops" in current_user.roles or "global_admin" in current_user.roles:
-        pass  # internal roles may access any client's orders
-    else:
-        allowed_client_ids = {s["id"] for s in current_user.scopes if s["type"] == "wholesale_client"}
-        order = await _fetch_order(order_id)  # implement with parameterized query
-        if order is None or order["wholesale_client_id"] not in allowed_client_ids:
-            # Return 404, not 403, to avoid leaking existence of other tenants' resources
+        order = await db.fetch_wholesale_order(order_id)
+        if order is None:
             raise HTTPException(status_code=404, detail="Order not found.")
+        return order
 
-    return await _fetch_order(order_id)
-
-
-async def _fetch_order(order_id: str) -> Optional[dict]:
-    raise NotImplementedError
+    allowed_client_ids = {s["id"] for s in current_user.scopes if s["type"] == "wholesale_client"}
+    order = await db.fetch_wholesale_order(order_id)
+    if order is None or str(order["wholesale_client_id"]) not in allowed_client_ids:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    return order
